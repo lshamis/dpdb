@@ -1,6 +1,5 @@
 import glob
 import io
-import json
 import os
 import pdb
 import readline
@@ -329,8 +328,40 @@ All other commands are forwarded to the connected pdb.
     def dpdb_attach(args):
         set_active(Commands.dpdb_pause(args))
 
+    @staticmethod
+    def dispatch(cmd, args):
+        if not hasattr(Commands, f"dpdb_{cmd}"):
+            print("unknown command")
+        getattr(Commands, f"dpdb_{cmd}")(args)
+
+
+def completer(text, state):
+    try:
+        commands = [
+            method[len("dpdb_") :]
+            for method in dir(Commands)
+            if method.startswith("dpdb_")
+        ]
+
+        line = readline.get_line_buffer().split()
+        if not line or (len(line) == 1 and "dpbd".startswith(line[0])):
+            # If we're on the first word, complete top-level commands
+            return ["dpdb"][state]
+
+        if len(line) == 2 and line[0] == "dpdb":
+            # If we're on the second word and the first word is "dpdb", complete with sub-commands
+            return [
+                cmd for cmd in commands if cmd.startswith(line[1]) and cmd != line[1]
+            ][state]
+    except IndexError:
+        pass
+    return None
+
 
 def main():
+    readline.parse_and_bind("tab: complete")
+    readline.set_completer(completer)
+
     def onsignal(signum, frame):
         targets = list(State.connections.keys())
         for target in targets:
@@ -364,22 +395,7 @@ def main():
             if len(parts) < 2:
                 continue
             State.known_targets = set(scan_targets())
-
-            subcmd = parts[1]
-            if subcmd == "help":
-                Commands.dpdb_help(parts[2:])
-            elif subcmd == "list":
-                Commands.dpdb_list(parts[2:])
-            elif subcmd == "pause":
-                Commands.dpdb_pause(parts[2:])
-            elif subcmd == "resume":
-                Commands.dpdb_resume(parts[2:])
-            elif subcmd == "attach":
-                Commands.dpdb_attach(parts[2:])
-            elif subcmd == "detach":
-                Commands.dpdb_detach(parts[2:])
-            else:
-                print("unknown command")
+            Commands.dispatch(parts[1], parts[2:])
             print()
         else:
             if not State.active_target:
