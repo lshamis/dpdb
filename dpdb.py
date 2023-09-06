@@ -1,5 +1,6 @@
 import glob
 import io
+import inspect
 import os
 import pdb
 import readline
@@ -10,18 +11,6 @@ import threading
 from dataclasses import dataclass
 from types import FrameType
 from typing import Optional
-
-import a0
-
-
-def node(name: Optional[str] = None) -> str:
-    if name is not None and not hasattr(node, "_name"):
-        node._name = name
-    elif name is not None and hasattr(node, "_name"):
-        raise RuntimeError("Node has already been initialized.")
-    elif name is None and not hasattr(node, "_name"):
-        raise RuntimeError("Node has not been initialized.")
-    return node._name
 
 
 @dataclass(frozen=True)
@@ -36,7 +25,7 @@ class Target:
 
     @staticmethod
     def here():
-        return Target(node(), threading.current_thread().name)
+        return Target(Target.here.node, threading.current_thread().name)
 
     @property
     def sock_path(self):
@@ -45,10 +34,6 @@ class Target:
     @property
     def pid_path(self):
         return f"/dev/shm/dpdb/{self.node}.pid"
-
-    @property
-    def deadman_topic(self):
-        return f"dpdb/{self.node}/{self.thread}"
 
 
 class PdbIO:
@@ -76,6 +61,9 @@ class DisconnectablePdb(pdb.Pdb):
 
     def do_disconnect(self, arg):
         self._io.remote_sock_io = None
+        os.remove(Target.here().sock_path)
+        if Target.here().thread == "MainThread":
+            declare_thread()
         self.set_continue()
 
 
@@ -83,7 +71,6 @@ class DisconnectablePdb(pdb.Pdb):
 class ThreadContext:
     pdb: pdb.Pdb
     sock: Optional[socket.socket]
-    deadman: a0.Deadman
 
 
 def thread_ctx() -> ThreadContext:
@@ -94,7 +81,6 @@ def thread_ctx() -> ThreadContext:
         thread_ctx._thread_local.ctx = ThreadContext(
             pdb=DisconnectablePdb(),
             sock=None,
-            deadman=a0.Deadman(Target.here().deadman_topic),
         )
 
     return thread_ctx._thread_local.ctx
@@ -103,27 +89,24 @@ def thread_ctx() -> ThreadContext:
 def pdb_connect() -> pdb.Pdb:
     ctx = thread_ctx()
 
-    if ctx.pdb._io.remote_sock_io:
-        return ctx.pdb
-
-    server, _ = ctx.sock.accept()
-    ctx.pdb._io.remote_sock_io = server.makefile("rw", buffering=1)
+    if not ctx.pdb._io.remote_sock_io:
+        server, _ = ctx.sock.accept()
+        ctx.pdb._io.remote_sock_io = server.makefile("rw", buffering=1)
 
     return ctx.pdb
 
 
 def declare_thread():
     ctx = thread_ctx()
-    if not ctx.deadman.try_take():
-        return
 
     sock_path = Target.here().sock_path
     os.makedirs(os.path.dirname(sock_path), exist_ok=True)
 
-    ctx.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    ctx.sock.bind(sock_path)
-    os.chmod(sock_path, 0o666)
-    ctx.sock.listen(1)
+    if not os.path.exists(sock_path):
+        ctx.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        ctx.sock.bind(sock_path)
+        os.chmod(sock_path, 0o666)
+        ctx.sock.listen(1)
 
 
 def set_trace() -> None:
@@ -144,6 +127,7 @@ def set_trace() -> None:
 
 
 def onsignal(signum: int, frame: FrameType) -> None:
+    declare_thread()
     pdb_connect().set_trace(sys._getframe().f_back)
 
 
@@ -162,15 +146,17 @@ def InitNode(name: str) -> None:
             dpdb.InitNode('my_node_name')
             # ... rest of the code ...
     """
-    node(name)
+    Target.here.node = name
 
     for file in glob.glob(Target(name, "*").sock_path):
         os.remove(file)
 
-    signal.signal(signal.SIGUSR1, onsignal)
     declare_thread()
+    signal.signal(signal.SIGUSR1, onsignal)
 
-    with open(Target.here().pid_path, "w") as pid_file:
+    pid_path = Target.here().pid_path
+    os.makedirs(os.path.dirname(pid_path), exist_ok=True)
+    with open(pid_path, "w") as pid_file:
         pid_file.write(str(os.getpid()))
 
 
@@ -181,8 +167,8 @@ class Connection:
     def __init__(self, target: Target):
         self.target = target
         self.pdb_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.pdb_client.connect(target.sock_path)
         self.pdb_io = self.pdb_client.makefile("rw", buffering=1)
+        self.pdb_client.connect(target.sock_path)
         self.read()  # Clear initial output.
 
     def __del__(self):
@@ -221,11 +207,20 @@ def set_active(target: Target):
 
 
 def scan_targets():
-    for path in glob.glob(Target("*", "*").sock_path):
+    for path in glob.glob(Target("*", "*").pid_path):
         parts = path.split("/")
-        target = Target(parts[-2], parts[-1][: -len(".sock")])
-        if a0.Deadman(target.deadman_topic).state().is_taken:
+        target = Target(parts[-1][: -len(".pid")], "MainThread")
+        try:
+            os.kill(int(open(path).read()), 0)
             yield target
+        except ProcessLookupError:
+            os.remove(path)
+
+        for path in glob.glob(Target(target.node, "*").sock_path):
+            parts = path.split("/")
+            thread_target = Target(parts[-2], parts[-1][: -len(".sock")])
+            if thread_target != target:
+                yield thread_target
 
 
 def signal_connect(target: Target) -> Connection:
@@ -250,7 +245,7 @@ def parse_target(s: Optional[str]) -> Target:
 
 class Commands:
     @staticmethod
-    def dpdb_list(args):
+    def dpdb_list():
         list_elem = {}
         for target in State.known_targets:
             if target == State.active_target:
@@ -264,7 +259,7 @@ class Commands:
             print(f"[{state=}] {str(target)}")
 
     @staticmethod
-    def dpdb_help(args):
+    def dpdb_help():
         print(
             """DPDB (Distributed-PDB):
 * dpdb help: This.
@@ -278,33 +273,30 @@ All other commands are forwarded to the connected pdb.
         )
 
     @staticmethod
-    def dpdb_pause(args) -> Optional[Target]:
-        try:
-            target = parse_target(args[0])
-        except ValueError as err:
-            print(err)
-            return None
-
+    def dpdb_pause(target) -> Optional[Target]:
         if target not in State.known_targets:
             print("unknown target")
             return None
 
-        if target not in State.connections:
-            if target.thread == "MainThread":
+        if target in State.connections:
+            return target
+        
+        if target.thread == "MainThread":
+            try:
                 State.connections[target] = signal_connect(target)
-            else:
-                State.connections[target] = Connection(target)
+                return target
+            except ProcessLookupError:
+                print("stale pid. removing")
+                os.remove(target.pid_path)
+                os.remove(target.sock_path)
+                return None
 
+        State.connections[target] = Connection(target)
         return target
 
-    @staticmethod
-    def dpdb_resume(args):
-        try:
-            target = parse_target(args[0])
-        except ValueError as err:
-            print(err)
-            return
 
+    @staticmethod
+    def dpdb_resume(target):
         if target not in State.known_targets:
             print("unknown target")
             return
@@ -319,20 +311,28 @@ All other commands are forwarded to the connected pdb.
             set_active(None)
 
     @staticmethod
-    def dpdb_detach(args):
+    def dpdb_detach():
         if not State.active_target:
             return
         Commands.dpdb_resume([str(State.active_target)])
 
     @staticmethod
-    def dpdb_attach(args):
-        set_active(Commands.dpdb_pause(args))
+    def dpdb_attach(target):
+        set_active(Commands.dpdb_pause(target))
 
     @staticmethod
     def dispatch(cmd, args):
         if not hasattr(Commands, f"dpdb_{cmd}"):
             print("unknown command")
-        getattr(Commands, f"dpdb_{cmd}")(args)
+        fn = getattr(Commands, f"dpdb_{cmd}")
+        kwargs = {}
+        if "target" in inspect.signature(fn).parameters:
+            try:
+                kwargs["target"] = parse_target(args[0])
+            except ValueError as err:
+                print(err)
+                return
+        fn(**kwargs)
 
 
 def completer(text, state):
@@ -349,10 +349,18 @@ def completer(text, state):
             return ["dpdb"][state]
 
         if len(line) == 2 and line[0] == "dpdb":
-            # If we're on the second word and the first word is "dpdb", complete with sub-commands
-            return [
-                cmd for cmd in commands if cmd.startswith(line[1]) and cmd != line[1]
-            ][state]
+            if line[1] not in commands:
+                # If we're on the second word and the first word is "dpdb", complete with sub-commands
+                return [
+                    cmd for cmd in commands if cmd.startswith(line[1]) and cmd != line[1]
+                ][state]
+
+        if len(line) == 3 and line[0] == "dpdb" and line[1] in commands:
+            active_subcommand = getattr(Commands, f"dpdb_{line[1]}")
+            if "target" in inspect.signature(active_subcommand).parameters:
+                return sorted(str(target) for target in State.known_targets if str(target).startswith(line[2]))[state]
+
+
     except IndexError:
         pass
     return None
@@ -373,17 +381,17 @@ def main():
     State.known_targets = set(scan_targets())
 
     print()
-    Commands.dpdb_help(None)
+    Commands.dpdb_help()
     if State.known_targets:
         print("Detected Nodes")
         print("--------------")
-        Commands.dpdb_list(None)
+        Commands.dpdb_list()
     print()
 
     while True:
-        active_repr = f" {str(State.active_target)}" if State.active_target else ""
+        active_repr = f" attached to {str(State.active_target)}" if State.active_target else " dettached"
         try:
-            command = input(f"dpdb PDB{active_repr}\n$ ")
+            command = input(f"DPDB{active_repr}\n$ ")
         except EOFError:
             break
 
@@ -401,8 +409,13 @@ def main():
             if not State.active_target:
                 print("not attached")
                 continue
-            State.active_conn.write(command)
-            print(State.active_conn.read())
+            try:
+                State.active_conn.write(command)
+                print(State.active_conn.read())
+            except ConnectionAbortedError:
+                del State.connections[State.active_target]
+                set_active(None)
+
 
 
 if __name__ == "__main__":
