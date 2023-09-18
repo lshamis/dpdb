@@ -7,6 +7,7 @@ import readline
 import signal
 import socket
 import sys
+import time
 import threading
 from dataclasses import dataclass
 from types import FrameType
@@ -22,6 +23,9 @@ class Target:
         if self.thread == "MainThread":
             return self.node
         return f"{self.node}[{self.thread}]"
+
+    def __lt__(self, rhs: "Target") -> bool:
+        return str(self) < str(rhs)
 
     @staticmethod
     def here():
@@ -127,6 +131,7 @@ def set_trace() -> None:
 
 
 def onsignal(signum: int, frame: FrameType) -> None:
+    print(">> onsignal")
     declare_thread()
     pdb_connect().set_trace(sys._getframe().f_back)
 
@@ -151,7 +156,6 @@ def InitNode(name: str) -> None:
     for file in glob.glob(Target(name, "*").sock_path):
         os.remove(file)
 
-    declare_thread()
     signal.signal(signal.SIGUSR1, onsignal)
 
     pid_path = Target.here().pid_path
@@ -169,6 +173,7 @@ class Connection:
         self.pdb_client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.pdb_io = self.pdb_client.makefile("rw", buffering=1)
         self.pdb_client.connect(target.sock_path)
+        print(">> connected")
         self.read()  # Clear initial output.
 
     def __del__(self):
@@ -193,13 +198,12 @@ class Connection:
 
 @dataclass(frozen=True)
 class State:
-    known_targets = set()
     connections = {}
     active_target = None
     active_conn = None
 
 
-def set_active(target: Target):
+def set_active(target: Optional[Target] = None):
     State.active_target = target
     State.active_conn = None
     if target and target in State.connections:
@@ -226,6 +230,8 @@ def scan_targets():
 def signal_connect(target: Target) -> Connection:
     pid = int(open(target.pid_path).read())
     os.kill(pid, signal.SIGUSR1)
+    # TODO: Instead of sleeping, watch for the sock file.
+    time.sleep(0.1)
     return Connection(target)
 
 
@@ -247,7 +253,7 @@ class Commands:
     @staticmethod
     def dpdb_list():
         list_elem = {}
-        for target in State.known_targets:
+        for target in scan_targets():
             if target == State.active_target:
                 list_elem[target] = "active "
             elif target in State.connections:
@@ -274,13 +280,15 @@ All other commands are forwarded to the connected pdb.
 
     @staticmethod
     def dpdb_pause(target) -> Optional[Target]:
-        if target not in State.known_targets:
-            print("unknown target")
-            return None
-
         if target in State.connections:
             return target
-        
+
+        try:
+            State.connections[target] = Connection(target)
+            return target
+        except FileNotFoundError:
+            pass
+
         if target.thread == "MainThread":
             try:
                 State.connections[target] = signal_connect(target)
@@ -291,16 +299,11 @@ All other commands are forwarded to the connected pdb.
                 os.remove(target.sock_path)
                 return None
 
-        State.connections[target] = Connection(target)
-        return target
-
+        print(f"unable to pause {target=}")
+        return None
 
     @staticmethod
     def dpdb_resume(target):
-        if target not in State.known_targets:
-            print("unknown target")
-            return
-
         if target not in State.connections:
             return
 
@@ -314,7 +317,7 @@ All other commands are forwarded to the connected pdb.
     def dpdb_detach():
         if not State.active_target:
             return
-        Commands.dpdb_resume([str(State.active_target)])
+        Commands.dpdb_resume(State.active_target)
 
     @staticmethod
     def dpdb_attach(target):
@@ -352,14 +355,19 @@ def completer(text, state):
             if line[1] not in commands:
                 # If we're on the second word and the first word is "dpdb", complete with sub-commands
                 return [
-                    cmd for cmd in commands if cmd.startswith(line[1]) and cmd != line[1]
+                    cmd
+                    for cmd in commands
+                    if cmd.startswith(line[1]) and cmd != line[1]
                 ][state]
 
         if len(line) == 3 and line[0] == "dpdb" and line[1] in commands:
             active_subcommand = getattr(Commands, f"dpdb_{line[1]}")
             if "target" in inspect.signature(active_subcommand).parameters:
-                return sorted(str(target) for target in State.known_targets if str(target).startswith(line[2]))[state]
-
+                return sorted(
+                    str(target)
+                    for target in scan_targets()
+                    if str(target).startswith(line[2])
+                )[state]
 
     except IndexError:
         pass
@@ -373,23 +381,24 @@ def main():
     def onsignal(signum, frame):
         targets = list(State.connections.keys())
         for target in targets:
-            Commands.dpdb_resume([str(target)])
+            Commands.dpdb_resume(target)
         sys.exit(0)
 
     signal.signal(signal.SIGINT, onsignal)
 
-    State.known_targets = set(scan_targets())
-
     print()
     Commands.dpdb_help()
-    if State.known_targets:
-        print("Detected Nodes")
-        print("--------------")
-        Commands.dpdb_list()
+    print("Detected Nodes")
+    print("--------------")
+    Commands.dpdb_list()
     print()
 
     while True:
-        active_repr = f" attached to {str(State.active_target)}" if State.active_target else " dettached"
+        active_repr = (
+            f" attached to {str(State.active_target)}"
+            if State.active_target
+            else " dettached"
+        )
         try:
             command = input(f"DPDB{active_repr}\n$ ")
         except EOFError:
@@ -402,7 +411,6 @@ def main():
         if parts[0] == "dpdb":
             if len(parts) < 2:
                 continue
-            State.known_targets = set(scan_targets())
             Commands.dispatch(parts[1], parts[2:])
             print()
         else:
@@ -415,7 +423,6 @@ def main():
             except ConnectionAbortedError:
                 del State.connections[State.active_target]
                 set_active(None)
-
 
 
 if __name__ == "__main__":
